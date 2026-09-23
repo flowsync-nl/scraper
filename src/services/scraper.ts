@@ -1,21 +1,56 @@
 import { chromium, Browser, Page } from 'playwright';
+import { classifyFetch, headersToRecord } from './fetch-classifier';
+import { ScrapeFailure } from './scrape-failure';
+
+const BROWSER_ARGS = [
+  '--disable-blink-features=AutomationControlled',
+  '--disable-features=IsolateOrigins,site-per-process',
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-accelerated-2d-canvas',
+  '--no-first-run',
+  '--no-zygote',
+  '--disable-gpu',
+];
+
+const BROWSER_CONTEXT = {
+  userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  viewport: { width: 1920, height: 1080 },
+  locale: 'nl-NL',
+  timezoneId: 'Europe/Amsterdam',
+};
+
+function isBrowserDisconnect(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? '');
+  return /has been closed|browser disconnected|Target closed|Target page, context or browser has been closed|Connection closed/i.test(message);
+}
+
+function browserFailure(err: unknown): ScrapeFailure {
+  return new ScrapeFailure({
+    code: 'internal',
+    reason: 'browser_unavailable',
+    retryable: false,
+    stage: 'browser',
+    message: err instanceof Error ? err.message : 'Browser unavailable',
+  });
+}
 
 export class ScraperService {
   private browser: Browser | null = null;
+  private relaunchUsed = false;
 
   needsJavaScript(html: string): boolean {
-    // Very short pages likely need JS
     if (html.length < 1000) return true;
 
     const spaIndicators = [
       /<div id="(root|app|__next)">\s*<\/div>/i,
       /loading\.\.\./i,
       /<noscript>.*enable javascript/i,
-      /glimlach/i, // Coolblue loading page
-      /<body[^>]*>\s*<\/body>/i, // Empty body
+      /glimlach/i,
+      /<body[^>]*>\s*<\/body>/i,
     ];
 
-    // Check if there's actual meaningful content
     const textContent = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
     const hasContent = textContent.length > 500;
     const hasSpaIndicator = spaIndicators.some(pattern => pattern.test(html));
@@ -47,7 +82,7 @@ export class ScraperService {
     return [...new Set(links)];
   }
 
-  async fetchWithHttp(url: string, timeout = 10000): Promise<{ html: string; status: number }> {
+  async fetchWithHttp(url: string, timeout = 10000): Promise<{ html: string; status: number; headers: Record<string, string> }> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout);
 
@@ -61,57 +96,37 @@ export class ScraperService {
       });
 
       const html = await response.text();
-      return { html, status: response.status };
+      return { html, status: response.status, headers: headersToRecord(response.headers) };
     } finally {
       clearTimeout(timeoutId);
     }
   }
 
-  async fetchWithPlaywright(url: string, timeout = 45000): Promise<{ html: string; status: number }> {
-    if (!this.browser) {
-      this.browser = await chromium.launch({
-        headless: true,
-        args: [
-          '--disable-blink-features=AutomationControlled',
-          '--disable-features=IsolateOrigins,site-per-process',
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--disable-gpu',
-        ],
-      });
-    }
-
-    const context = await this.browser.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      viewport: { width: 1920, height: 1080 },
-      locale: 'nl-NL',
-      timezoneId: 'Europe/Amsterdam',
-    });
-
+  async fetchWithPlaywright(
+    url: string,
+    timeout = 45000,
+    mode: 'full' | 'probe' = 'full',
+  ): Promise<{ html: string; status: number; headers: Record<string, string> }> {
+    const context = await this.openContext();
     const page = await context.newPage();
-
-    // Remove webdriver property to avoid detection
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      // @ts-ignore
-      window.chrome = { runtime: {} };
-    });
+    await this.installPatches(page);
 
     try {
-      const response = await page.goto(url, { waitUntil: 'networkidle', timeout });
+      const response = await page.goto(url, {
+        waitUntil: mode === 'probe' ? 'domcontentloaded' : 'networkidle',
+        timeout,
+      });
       const status = response?.status() ?? 0;
+      const headers = response ? lowerCaseHeaders(response.headers()) : {};
+      const earlyHtml = await page.content();
 
-      // Wait for content to load
+      if (mode === 'probe' || classifyFetch(status, headers, earlyHtml).kind === 'challenge') {
+        return { html: earlyHtml, status, headers };
+      }
+
       await page.waitForTimeout(3000);
-
-      // Dismiss cookie consent banners
       await this.dismissCookieConsent(page);
 
-      // Scroll to load lazy content
       await page.evaluate(async () => {
         for (let i = 0; i < 3; i++) {
           window.scrollBy(0, window.innerHeight);
@@ -120,11 +135,10 @@ export class ScraperService {
         window.scrollTo(0, 0);
       });
 
-      // Wait a bit more after scrolling
       await page.waitForTimeout(2000);
 
       const html = await page.content();
-      return { html, status };
+      return { html, status, headers };
     } finally {
       await context.close();
     }
@@ -139,37 +153,9 @@ export class ScraperService {
     callback: (page: Page) => Promise<T>,
     timeout = 45000,
   ): Promise<{ result: T; html: string; status: number }> {
-    if (!this.browser) {
-      this.browser = await chromium.launch({
-        headless: true,
-        args: [
-          '--disable-blink-features=AutomationControlled',
-          '--disable-features=IsolateOrigins,site-per-process',
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--disable-gpu',
-        ],
-      });
-    }
-
-    const context = await this.browser.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      viewport: { width: 1920, height: 1080 },
-      locale: 'nl-NL',
-      timezoneId: 'Europe/Amsterdam',
-    });
-
+    const context = await this.openContext();
     const page = await context.newPage();
-
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      // @ts-ignore
-      window.chrome = { runtime: {} };
-    });
+    await this.installPatches(page);
 
     try {
       const response = await page.goto(url, { waitUntil: 'networkidle', timeout });
@@ -202,9 +188,72 @@ export class ScraperService {
     return { html, usedPlaywright: true, status };
   }
 
+  protected async launchBrowser(): Promise<Browser> {
+    return chromium.launch({
+      headless: true,
+      args: BROWSER_ARGS,
+    });
+  }
+
+  private async acquireBrowser(): Promise<Browser> {
+    if (this.browser?.isConnected()) return this.browser;
+
+    const dead = this.browser !== null;
+    this.browser = null;
+
+    if (dead) {
+      if (this.relaunchUsed) throw browserFailure(new Error('Shared browser disconnected'));
+      this.relaunchUsed = true;
+    }
+
+    try {
+      this.browser = await this.launchBrowser();
+      return this.browser;
+    } catch (err) {
+      if (this.relaunchUsed) throw browserFailure(err);
+      this.relaunchUsed = true;
+      try {
+        this.browser = await this.launchBrowser();
+        return this.browser;
+      } catch (err2) {
+        throw browserFailure(err2);
+      }
+    }
+  }
+
+  private async openContext() {
+    const browser = await this.acquireBrowser();
+    try {
+      return await browser.newContext(BROWSER_CONTEXT);
+    } catch (err) {
+      if (!isBrowserDisconnect(err)) throw err;
+      try {
+        await browser.close();
+      } catch {
+        // The shared browser is already gone.
+      }
+      this.browser = null;
+      if (this.relaunchUsed) throw browserFailure(err);
+      this.relaunchUsed = true;
+      const next = await this.acquireBrowser();
+      try {
+        return await next.newContext(BROWSER_CONTEXT);
+      } catch (err2) {
+        throw browserFailure(err2);
+      }
+    }
+  }
+
+  private async installPatches(page: Page): Promise<void> {
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      // @ts-ignore
+      window.chrome = { runtime: {} };
+    });
+  }
+
   private async dismissCookieConsent(page: Page): Promise<void> {
     const selectors = [
-      // Veelvoorkomende cookie consent knoppen (Nederlands + Engels)
       'button:has-text("Accepteren")',
       'button:has-text("Alles accepteren")',
       'button:has-text("Alle cookies accepteren")',
@@ -217,7 +266,6 @@ export class ScraperService {
       'button:has-text("Begrepen")',
       'button:has-text("OK")',
       'button:has-text("Agree")',
-      // Veelvoorkomende cookie consent frameworks
       '#onetrust-accept-btn-handler',
       '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
       '.cc-accept',
@@ -227,7 +275,6 @@ export class ScraperService {
       '.js-cookie-accept',
       '#cookie-accept',
       '.cmplz-accept',
-      // CookieYes
       '.cky-btn-accept',
       '[data-cky-tag="accept-button"]',
     ];
@@ -252,4 +299,12 @@ export class ScraperService {
       this.browser = null;
     }
   }
+}
+
+function lowerCaseHeaders(headers: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    out[key.toLowerCase()] = value;
+  }
+  return out;
 }

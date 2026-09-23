@@ -22,6 +22,8 @@
 
     .container {
       max-width: 1000px;
+      width: 100%;
+      min-width: 0;
       margin: 0 auto;
     }
 
@@ -65,6 +67,8 @@
       border-radius: 12px;
       padding: 1.5rem;
       margin-bottom: 1.5rem;
+      max-width: 100%;
+      overflow-x: auto;
     }
 
     .info-box {
@@ -193,6 +197,8 @@
       display: none;
       padding: 1.5rem;
       border-top: 1px solid #334155;
+      max-width: 100%;
+      overflow-x: auto;
     }
 
     .endpoint.open .endpoint-body {
@@ -339,7 +345,10 @@
     .status-200 { background: #14532d; color: #4ade80; }
     .status-400 { background: #7c2d12; color: #fb923c; }
     .status-401 { background: #7c2d12; color: #fb923c; }
+    .status-422 { background: #713f12; color: #fbbf24; }
     .status-500 { background: #450a0a; color: #f87171; }
+    .status-502 { background: #450a0a; color: #f87171; }
+    .status-504 { background: #450a0a; color: #f87171; }
 
     /* Syntax highlighting */
     .json-key { color: #93c5fd; }
@@ -516,6 +525,9 @@
             <button class="copy-btn" onclick="copyCode(this)">Kopieer</button>
             <pre id="curlExample"><code></code></pre>
           </div>
+
+          <h3>Errors</h3>
+          <p>Een mislukte scrape antwoordt met <code>error</code>, <code>code</code>, optioneel <code>reason</code>, <code>retryable</code>, <code>domain</code> en optioneel <code>target</code> (url, http-status, vendor). Geen HTML en geen stack. Een bot-block is HTTP 422 <code>blocked</code> en wordt niet als lege career page gecached. Zie <a href="#errors">Error Codes</a>.</p>
 
           <h3>Response (200 OK)</h3>
           <div class="code-block">
@@ -1132,23 +1144,81 @@
             <tr>
               <td><span class="status-badge status-500">500</span></td>
               <td>Server Error</td>
-              <td>Scraping mislukt (website onbereikbaar, parsing error, etc.)</td>
+              <td>Onverwachte fout. Voor <code>POST /api/scrape</code> is dit <code>internal</code>; een block is dat niet.</td>
             </tr>
           </tbody>
         </table>
 
-        <h3>Error Response Formaat</h3>
+        <h3>POST /api/scrape</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>code</th>
+              <th>retryable</th>
+              <th>Wanneer</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="status-badge status-400">400</span></td>
+              <td><code>invalid_request</code></td>
+              <td>false</td>
+              <td>Request-body voldoet niet aan het schema</td>
+            </tr>
+            <tr>
+              <td><span class="status-badge status-401">401</span></td>
+              <td><code>unauthorized</code></td>
+              <td>false</td>
+              <td>Bearer token ontbreekt of klopt niet</td>
+            </tr>
+            <tr>
+              <td><span class="status-badge status-422">422</span></td>
+              <td><code>blocked</code></td>
+              <td>false</td>
+              <td>Captcha of interstitial (vendor bijv. siteground). Per domein, geen scraper-storing</td>
+            </tr>
+            <tr>
+              <td><span class="status-badge status-502">502</span></td>
+              <td><code>upstream_unavailable</code></td>
+              <td>true</td>
+              <td>Doelsite 5xx of transport, na één retry</td>
+            </tr>
+            <tr>
+              <td><span class="status-badge status-504">504</span></td>
+              <td><code>timeout</code></td>
+              <td>true</td>
+              <td>Budget van 25s of een fetch-timeout</td>
+            </tr>
+            <tr>
+              <td><span class="status-badge status-502">502</span></td>
+              <td><code>extractor_failed</code></td>
+              <td>false / true</td>
+              <td>Model of parser. <code>model_unavailable</code> en <code>extractor_parse</code> zijn niet retryable; provider 429/529 wel</td>
+            </tr>
+            <tr>
+              <td><span class="status-badge status-500">500</span></td>
+              <td><code>internal</code></td>
+              <td>false</td>
+              <td>Onverwachte fout, waaronder een browser die na één herstart nog weg is</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Error Response Formaat (POST /api/scrape)</h3>
         <div class="code-block">
           <button class="copy-btn" onclick="copyCode(this)">Kopieer</button>
           <pre><code>{
-  <span class="json-key">"error"</span>: <span class="json-string">"Invalid request"</span>,
-  <span class="json-key">"details"</span>: [
-    {
-      <span class="json-key">"code"</span>: <span class="json-string">"custom"</span>,
-      <span class="json-key">"message"</span>: <span class="json-string">"Invalid domain format"</span>,
-      <span class="json-key">"path"</span>: [<span class="json-string">"domain"</span>]
-    }
-  ]
+  <span class="json-key">"error"</span>: <span class="json-string">"Target blocked the scrape"</span>,
+  <span class="json-key">"code"</span>: <span class="json-string">"blocked"</span>,
+  <span class="json-key">"reason"</span>: <span class="json-string">"bot_challenge"</span>,
+  <span class="json-key">"retryable"</span>: <span class="json-boolean">false</span>,
+  <span class="json-key">"domain"</span>: <span class="json-string">"bas-hr.nl"</span>,
+  <span class="json-key">"target"</span>: {
+    <span class="json-key">"url"</span>: <span class="json-string">"https://bas-hr.nl/vacatures"</span>,
+    <span class="json-key">"httpStatus"</span>: <span class="json-number">202</span>,
+    <span class="json-key">"vendor"</span>: <span class="json-string">"siteground"</span>
+  }
 }</code></pre>
         </div>
       </div>

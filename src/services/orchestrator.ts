@@ -1,58 +1,96 @@
-// src/services/orchestrator.ts
 import { CacheService } from './cache';
 import { ScraperService } from './scraper';
 import { DiscoveryService } from './discovery';
 import { AIExtractor } from './ai-extractor';
 import { parseWithPlatform } from './platforms';
-import { ScrapeResponse } from '../types/vacancy';
+import { GuardedFetcher, type GuardedFetchResult } from './guarded-fetcher';
+import { classifyFetch } from './fetch-classifier';
+import { BlockLock, safeErrorMessage, ScrapeFailure } from './scrape-failure';
+import { ScrapeResponse, Vacancy } from '../types/vacancy';
+
+export const SCRAPE_BUDGET_MS = 25_000;
+const BLOCK_LOCK_SECONDS = 10 * 60;
 
 export class Orchestrator {
   private cache: CacheService;
   private scraper: ScraperService;
   private discovery: DiscoveryService;
   private aiExtractor: AIExtractor;
+  private fetcher: GuardedFetcher;
+  private budgetMs: number;
 
-  constructor(config: { redisUrl?: string; anthropicApiKey: string }) {
-    this.cache = new CacheService(config.redisUrl);
-    this.scraper = new ScraperService();
-    this.discovery = new DiscoveryService(this.scraper);
-    this.aiExtractor = new AIExtractor(config.anthropicApiKey);
+  constructor(config: {
+    redisUrl?: string;
+    anthropicApiKey: string;
+    cache?: CacheService;
+    scraper?: ScraperService;
+    discovery?: DiscoveryService;
+    aiExtractor?: AIExtractor;
+    fetcher?: GuardedFetcher;
+    budgetMs?: number;
+  }) {
+    this.cache = config.cache ?? new CacheService(config.redisUrl);
+    this.scraper = config.scraper ?? new ScraperService();
+    this.fetcher = config.fetcher ?? new GuardedFetcher(this.scraper);
+    this.discovery = config.discovery ?? new DiscoveryService(this.scraper, this.fetcher);
+    this.aiExtractor = config.aiExtractor ?? new AIExtractor(config.anthropicApiKey);
+    this.budgetMs = config.budgetMs ?? SCRAPE_BUDGET_MS;
   }
 
   async scrape(domain: string, detailLimit: number = 0): Promise<ScrapeResponse> {
     const cacheKey = this.cache.keyFor(domain + (detailLimit > 0 ? `:details:${detailLimit}` : ''));
 
-    // Check cache
     const cached = await this.cache.get<ScrapeResponse>(cacheKey);
     if (cached) {
       return { ...cached, cached: true };
     }
 
-    // Find career page
-    const careerPage = await this.discovery.findCareerPage(domain);
+    const lockKey = this.cache.blockKeyFor(domain);
+    const locked = await this.cache.get<BlockLock>(lockKey);
+    if (locked?.code === 'blocked') {
+      console.info(JSON.stringify({
+        msg: 'scrape block lock hit',
+        domain,
+        code: 'blocked',
+        chromium: false,
+      }));
+      throw ScrapeFailure.fromLock(locked, domain);
+    }
+
+    const deadline = Date.now() + this.budgetMs;
+    try {
+      return await this.scrapeUncached(domain, detailLimit, cacheKey, deadline);
+    } catch (err) {
+      if (err instanceof ScrapeFailure) {
+        err.attachDomain(domain);
+        if (err.code === 'blocked') {
+          await this.cache.set(lockKey, err.toLock(), BLOCK_LOCK_SECONDS);
+        }
+      }
+      throw err;
+    }
+  }
+
+  private async scrapeUncached(
+    domain: string,
+    detailLimit: number,
+    cacheKey: string,
+    deadline: number,
+  ): Promise<ScrapeResponse> {
+    this.assertBudget(deadline, domain);
+    const careerPage = await this.discovery.findCareerPage(domain, deadline);
 
     if (!careerPage) {
-      const response: ScrapeResponse = {
-        domain,
-        hasVacancies: false,
-        vacancyCount: 0,
-        vacancies: [],
-        source: {
-          platform: null,
-          careerPageUrl: '',
-          method: 'ai',
-        },
-        cached: false,
-        scrapedAt: new Date().toISOString(),
-      };
+      const response = this.emptyResponse(domain);
       await this.cache.set(cacheKey, response);
       return response;
     }
 
-    let vacancies;
+    this.assertPageAllowed(careerPage.html, careerPage.url, domain);
+
+    let vacancies: Vacancy[] | undefined;
     let method: 'parser' | 'ai' = 'ai';
 
-    // Try platform parser first
     if (careerPage.platform) {
       const platformVacancies = await parseWithPlatform(careerPage.platform, careerPage.url);
       if (platformVacancies) {
@@ -61,9 +99,7 @@ export class Orchestrator {
       }
     }
 
-    // Fall back to AI extraction
     if (!vacancies) {
-      // First extract from main career page
       const result = await this.aiExtractor.extract(
         careerPage.html,
         careerPage.url,
@@ -72,40 +108,44 @@ export class Orchestrator {
       vacancies = result.vacancies;
       method = 'ai';
 
-      // If we found few vacancies, try scraping department pages
       if (vacancies.length < 5) {
         const departmentLinks = this.discovery.extractDepartmentLinks(careerPage.html, careerPage.url);
         console.log(`Found ${departmentLinks.length} department links to check`);
 
-        // Scrape up to 5 department pages
         for (const deptUrl of departmentLinks.slice(0, 5)) {
+          this.assertBudget(deadline, domain);
           try {
-            const { html: deptHtml } = await this.scraper.fetch(deptUrl);
-            const deptResult = await this.aiExtractor.extract(deptHtml, deptUrl);
+            const deptPage = await this.fetcher.fetch(deptUrl, deadline);
+            if (deptPage.classification.kind === 'challenge') {
+              this.warnBlocked(domain, deptUrl, deptPage, 'department');
+              continue;
+            }
+            if (deptPage.classification.kind !== 'ok') continue;
+            this.assertPageAllowed(deptPage.html, deptUrl, domain);
+            const deptResult = await this.aiExtractor.extract(deptPage.html, deptUrl);
 
-            // Add new vacancies (dedupe by ID)
             const existingIds = new Set(vacancies.map(v => v.id));
-            for (const v of deptResult.vacancies) {
-              if (!existingIds.has(v.id)) {
-                vacancies.push(v);
-                existingIds.add(v.id);
+            for (const vacancy of deptResult.vacancies) {
+              if (!existingIds.has(vacancy.id)) {
+                vacancies.push(vacancy);
+                existingIds.add(vacancy.id);
               }
             }
           } catch (err) {
-            console.error(`Failed to scrape department page ${deptUrl}:`, err);
+            this.rethrowFatal(err);
+            console.error(`Failed to scrape department page ${deptUrl}: ${safeErrorMessage(err)}`);
           }
         }
       }
     }
 
-    // Scrape individual vacancy pages for more details if requested
     if (detailLimit > 0 && vacancies.length > 0) {
       console.log(`Scraping details for up to ${detailLimit} vacancies...`);
       const vacanciesToDetail = vacancies.slice(0, detailLimit);
 
       for (let i = 0; i < vacanciesToDetail.length; i++) {
+        this.assertBudget(deadline, domain);
         const vacancy = vacanciesToDetail[i];
-        // Skip if URL is the same as career page (no dedicated vacancy page)
         if (vacancy.url === careerPage.url) {
           console.log(`Skipping ${vacancy.title} - no dedicated page`);
           continue;
@@ -113,14 +153,19 @@ export class Orchestrator {
 
         try {
           console.log(`[${i + 1}/${vacanciesToDetail.length}] Fetching details for: ${vacancy.title}`);
-          const { html: detailHtml } = await this.scraper.fetch(vacancy.url);
-          const details = await this.aiExtractor.extractDetails(detailHtml, vacancy);
-
-          // Merge details into vacancy
+          const detailPage = await this.fetcher.fetch(vacancy.url, deadline);
+          if (detailPage.classification.kind === 'challenge') {
+            this.warnBlocked(domain, vacancy.url, detailPage, 'detail');
+            continue;
+          }
+          if (detailPage.classification.kind !== 'ok') continue;
+          this.assertPageAllowed(detailPage.html, vacancy.url, domain);
+          const details = await this.aiExtractor.extractDetails(detailPage.html, vacancy);
           Object.assign(vacancy, details);
           console.log(`  ✓ Got details: ${details.requirements?.length || 0} requirements, ${details.benefits?.length || 0} benefits`);
         } catch (err) {
-          console.error(`  ✗ Failed to get details for ${vacancy.title}:`, err);
+          this.rethrowFatal(err);
+          console.error(`  ✗ Failed to get details for ${vacancy.title}: ${safeErrorMessage(err)}`);
         }
       }
     }
@@ -141,6 +186,68 @@ export class Orchestrator {
 
     await this.cache.set(cacheKey, response);
     return response;
+  }
+
+  private emptyResponse(domain: string): ScrapeResponse {
+    return {
+      domain,
+      hasVacancies: false,
+      vacancyCount: 0,
+      vacancies: [],
+      source: {
+        platform: null,
+        careerPageUrl: '',
+        method: 'ai',
+      },
+      cached: false,
+      scrapedAt: new Date().toISOString(),
+    };
+  }
+
+  private assertBudget(deadline: number, domain: string): void {
+    if (Date.now() >= deadline) {
+      throw new ScrapeFailure({
+        code: 'timeout',
+        reason: 'timeout',
+        retryable: true,
+        domain,
+        stage: 'budget',
+        message: 'Scrape budget exceeded',
+      });
+    }
+  }
+
+  private assertPageAllowed(html: string, url: string, domain: string): void {
+    const classification = classifyFetch(200, {}, html);
+    if (classification.kind !== 'challenge') return;
+    throw new ScrapeFailure({
+      code: 'blocked',
+      reason: classification.reason ?? 'bot_challenge',
+      retryable: false,
+      domain,
+      stage: 'extract',
+      message: `Challenge HTML blocked before extraction at ${url}`,
+      target: { url, vendor: classification.vendor },
+    });
+  }
+
+  private warnBlocked(domain: string, url: string, page: GuardedFetchResult, where: string): void {
+    console.warn(JSON.stringify({
+      msg: 'scrape blocked url skipped',
+      domain,
+      code: 'blocked',
+      url,
+      vendor: page.classification.vendor,
+      httpStatus: page.status,
+      where,
+    }));
+  }
+
+  private rethrowFatal(err: unknown): void {
+    if (!(err instanceof ScrapeFailure)) return;
+    if (err.code === 'timeout' || err.reason === 'model_unavailable' || err.reason === 'browser_unavailable') {
+      throw err;
+    }
   }
 
   async close(): Promise<void> {

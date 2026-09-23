@@ -2,6 +2,87 @@ import Anthropic from '@anthropic-ai/sdk';
 import { Vacancy } from '../types/vacancy';
 import { createVacancyId } from '../utils/url';
 import { z } from 'zod';
+import { classifyFetch } from './fetch-classifier';
+import { isRetryableTransport } from './net-errors';
+import { ScrapeFailure } from './scrape-failure';
+
+export const DEFAULT_ANTHROPIC_MODEL = 'claude-haiku-4-5-20251001';
+
+interface CompletionClient {
+  messages: {
+    create: (body: {
+      model: string;
+      max_tokens: number;
+      messages: Array<{ role: 'user'; content: string }>;
+    }) => Promise<{ content: Array<{ type: string; text?: string }> }>;
+  };
+}
+
+function readStatus(err: unknown): number | undefined {
+  if (!err || typeof err !== 'object') return undefined;
+  const status = (err as { status?: unknown }).status;
+  return typeof status === 'number' ? status : undefined;
+}
+
+function readErrorType(err: unknown): string | undefined {
+  if (!err || typeof err !== 'object') return undefined;
+  const error = (err as { error?: { type?: unknown } }).error;
+  return error && typeof error.type === 'string' ? error.type : undefined;
+}
+
+function isModelUnavailable(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? '');
+  return readStatus(err) === 404 || readErrorType(err) === 'not_found_error' || /not_found_error/i.test(message);
+}
+
+function isRetryableAnthropic(err: unknown): boolean {
+  if (isModelUnavailable(err)) return false;
+  const status = readStatus(err);
+  const type = readErrorType(err);
+  if (status === 429 || status === 529 || type === 'rate_limit_error' || type === 'overloaded_error') return true;
+  return isRetryableTransport(err);
+}
+
+function mapAnthropicFailure(err: unknown): ScrapeFailure {
+  if (err instanceof ScrapeFailure) return err;
+  const message = err instanceof Error ? err.message : 'Extractor failed';
+  if (isModelUnavailable(err)) {
+    return new ScrapeFailure({
+      code: 'extractor_failed',
+      reason: 'model_unavailable',
+      retryable: false,
+      stage: 'extract',
+      message,
+    });
+  }
+  const status = readStatus(err);
+  const type = readErrorType(err);
+  if (status === 429 || status === 529 || type === 'rate_limit_error' || type === 'overloaded_error') {
+    return new ScrapeFailure({
+      code: 'extractor_failed',
+      reason: 'rate_limited',
+      retryable: true,
+      stage: 'extract',
+      message,
+    });
+  }
+  if (isRetryableTransport(err)) {
+    return new ScrapeFailure({
+      code: 'extractor_failed',
+      reason: 'network',
+      retryable: true,
+      stage: 'extract',
+      message,
+    });
+  }
+  return new ScrapeFailure({
+    code: 'extractor_failed',
+    reason: 'unexpected',
+    retryable: false,
+    stage: 'extract',
+    message,
+  });
+}
 
 // Helper to coerce arrays to comma-separated strings
 const stringOrArray = z.union([
@@ -52,10 +133,82 @@ const AIDetailSchema = z.object({
 });
 
 export class AIExtractor {
-  private client: Anthropic;
+  private client: CompletionClient;
 
-  constructor(apiKey: string) {
-    this.client = new Anthropic({ apiKey });
+  constructor(apiKey: string, client?: CompletionClient) {
+    this.client = client ?? (new Anthropic({ apiKey }) as unknown as CompletionClient);
+  }
+
+  private modelId(): string {
+    const configured = process.env.ANTHROPIC_MODEL?.trim();
+    return configured || DEFAULT_ANTHROPIC_MODEL;
+  }
+
+  private assertNotChallenge(html: string, url: string): void {
+    const classification = classifyFetch(200, {}, html);
+    if (classification.kind !== 'challenge') return;
+    throw new ScrapeFailure({
+      code: 'blocked',
+      reason: classification.reason ?? 'bot_challenge',
+      retryable: false,
+      stage: 'extract',
+      message: `Challenge HTML was not sent to the extractor for ${url}`,
+      target: { url, vendor: classification.vendor },
+    });
+  }
+
+  private async complete(prompt: string, maxTokens: number): Promise<string> {
+    let last: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await this.client.messages.create({
+          model: this.modelId(),
+          max_tokens: maxTokens,
+          messages: [{ role: 'user', content: prompt }],
+        });
+        const content = response.content[0];
+        if (!content || content.type !== 'text' || !content.text) {
+          throw new ScrapeFailure({
+            code: 'extractor_failed',
+            reason: 'extractor_parse',
+            retryable: false,
+            stage: 'extract',
+            message: 'Unexpected response type from Claude',
+          });
+        }
+        return content.text;
+      } catch (err) {
+        if (err instanceof ScrapeFailure) throw err;
+        last = err;
+        if (attempt === 0 && isRetryableAnthropic(err)) continue;
+        throw mapAnthropicFailure(err);
+      }
+    }
+    throw mapAnthropicFailure(last);
+  }
+
+  private parseModelJson<T>(text: string, parse: (value: unknown) => T): T {
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      throw new ScrapeFailure({
+        code: 'extractor_failed',
+        reason: 'extractor_parse',
+        retryable: false,
+        stage: 'extract',
+        message: 'No JSON found in Claude response',
+      });
+    }
+    try {
+      return parse(JSON.parse(jsonMatch[0]));
+    } catch (err) {
+      throw new ScrapeFailure({
+        code: 'extractor_failed',
+        reason: 'extractor_parse',
+        retryable: false,
+        stage: 'extract',
+        message: err instanceof Error ? err.message : 'Extractor parse failed',
+      });
+    }
   }
 
   cleanHtml(html: string): string {
@@ -124,25 +277,10 @@ ${cleanedHtml}`;
   }
 
   async extract(html: string, url: string, additionalUrls?: string[]): Promise<{ vacancies: Vacancy[]; confidence: number }> {
+    this.assertNotChallenge(html, url);
     const prompt = this.buildPrompt(html, url, additionalUrls);
-
-    const response = await this.client.messages.create({
-      model: 'claude-3-5-haiku-20241022',
-      max_tokens: 8192,
-      messages: [{ role: 'user', content: prompt }],
-    });
-
-    const content = response.content[0];
-    if (content.type !== 'text') {
-      throw new Error('Unexpected response type from Claude');
-    }
-
-    const jsonMatch = content.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error('No JSON found in Claude response');
-    }
-
-    const parsed = AIResponseSchema.parse(JSON.parse(jsonMatch[0]));
+    const text = await this.complete(prompt, 8192);
+    const parsed = this.parseModelJson(text, (value) => AIResponseSchema.parse(value));
     const now = new Date().toISOString();
 
     const vacancies: Vacancy[] = parsed.vacancies.map((v) => {
@@ -267,25 +405,10 @@ ${cleanedHtml}`;
   }
 
   async extractDetails(html: string, vacancy: Vacancy): Promise<Partial<Vacancy>> {
+    this.assertNotChallenge(html, vacancy.url);
     const prompt = this.buildDetailPrompt(html, vacancy.title);
-
-    const response = await this.client.messages.create({
-      model: 'claude-3-5-haiku-20241022',
-      max_tokens: 4096,
-      messages: [{ role: 'user', content: prompt }],
-    });
-
-    const content = response.content[0];
-    if (content.type !== 'text') {
-      throw new Error('Unexpected response type from Claude');
-    }
-
-    const jsonMatch = content.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      throw new Error('No JSON found in Claude response');
-    }
-
-    const parsed = AIDetailSchema.parse(JSON.parse(jsonMatch[0]));
+    const text = await this.complete(prompt, 4096);
+    const parsed = this.parseModelJson(text, (value) => AIDetailSchema.parse(value));
 
     // Merge with existing vacancy data, preferring new detailed data
     return {

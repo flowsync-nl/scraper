@@ -20,7 +20,10 @@ import { DiscoveryService } from './services/discovery';
 
 async function main() {
   const fastify = Fastify({
-    logger: false,
+    logger: {
+      level: process.env.LOG_LEVEL || 'info',
+      redact: ['req.headers.authorization', 'req.headers.cookie'],
+    },
   });
 
   await fastify.register(cors, {
