@@ -72,3 +72,23 @@ export function extractDomain(url: string): string {
 export function createVacancyId(url: string): string {
   return createHash('sha256').update(url).digest('hex').slice(0, 12);
 }
+
+/** Apex and www are the domain itself. Guessed career hosts are `other` and must not fail the scrape. */
+export function hostRole(url: string, domain: string): 'apex' | 'www' | 'other' {
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return 'other';
+  }
+  const apex = domain
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .split('/')[0]
+    .replace(/^www\./, '');
+  if (!apex) return 'other';
+  if (host === apex) return 'apex';
+  if (host === `www.${apex}`) return 'www';
+  return 'other';
+}

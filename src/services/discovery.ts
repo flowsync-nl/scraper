@@ -1,7 +1,17 @@
 import { ScraperService } from './scraper';
-import { getCareerPageCandidates, normalizeUrl } from '../utils/url';
+import { GuardedFetcher, type GuardedFetchResult } from './guarded-fetcher';
+import { classifyFetch, hasCareerSignals } from './fetch-classifier';
+import { ScrapeFailure } from './scrape-failure';
+import { getCareerPageCandidates, hostRole, normalizeUrl } from '../utils/url';
 
 export type Platform = 'recruitee' | 'greenhouse' | 'lever' | 'workable' | null;
+
+export interface CareerPage {
+  url: string;
+  html: string;
+  platform: Platform;
+  additionalUrls?: string[];
+}
 
 const CAREER_KEYWORDS = [
   'career', 'careers', 'job', 'jobs', 'vacatur', 'vacancies', 'vacancy',
@@ -9,10 +19,33 @@ const CAREER_KEYWORDS = [
   'recruitment', 'talent', 'opportunities', 'sollicit',
 ];
 
-export class DiscoveryService {
-  constructor(private scraper: ScraperService) {}
+interface DiscoverySignals {
+  sawOk: boolean;
+  sawNotFound: boolean;
+  sawUpstream: boolean;
+  sawNetwork: boolean;
+  sawTimeout: boolean;
+}
 
-  async fetchSitemapUrls(domain: string): Promise<string[]> {
+function freshSignals(): DiscoverySignals {
+  return {
+    sawOk: false,
+    sawNotFound: false,
+    sawUpstream: false,
+    sawNetwork: false,
+    sawTimeout: false,
+  };
+}
+
+export class DiscoveryService {
+  private readonly fetcher: GuardedFetcher;
+
+  constructor(private scraper: ScraperService, fetcher?: GuardedFetcher) {
+    this.fetcher = fetcher ?? new GuardedFetcher(scraper);
+  }
+
+  async fetchSitemapUrls(domain: string, deadline?: number): Promise<string[]> {
+    this.assertBudget(deadline, domain);
     const baseUrl = normalizeUrl(domain);
     const sitemapUrls = [
       `${baseUrl}/sitemap.xml`,
@@ -24,36 +57,37 @@ export class DiscoveryService {
     const allUrls: string[] = [];
 
     for (const sitemapUrl of sitemapUrls) {
+      this.assertBudget(deadline, domain);
       try {
         const response = await fetch(sitemapUrl, {
           headers: { 'User-Agent': 'Mozilla/5.0 (compatible; VacancyBot/1.0)' },
-          signal: AbortSignal.timeout(10000),
+          signal: AbortSignal.timeout(this.remainingTimeout(deadline, domain, 10000)),
         });
 
         if (!response.ok) continue;
 
         const xml = await response.text();
-        const urls = this.parseSitemapXml(xml);
+        const urls = this.readSitemapLocs(response.status, response.headers, xml);
+        if (urls.length === 0) continue;
 
-        // Check if this is a sitemap index (contains other sitemaps)
         const nestedSitemaps = urls.filter(u => u.endsWith('.xml'));
         if (nestedSitemaps.length > 0) {
-          // Fetch nested sitemaps that might contain career pages
           const careerSitemaps = nestedSitemaps.filter(u =>
             CAREER_KEYWORDS.some(kw => u.toLowerCase().includes(kw))
           );
 
           for (const nestedUrl of careerSitemaps.slice(0, 3)) {
+            this.assertBudget(deadline, domain);
             try {
               const nestedResponse = await fetch(nestedUrl, {
                 headers: { 'User-Agent': 'Mozilla/5.0 (compatible; VacancyBot/1.0)' },
-                signal: AbortSignal.timeout(10000),
+                signal: AbortSignal.timeout(this.remainingTimeout(deadline, domain, 10000)),
               });
-              if (nestedResponse.ok) {
-                const nestedXml = await nestedResponse.text();
-                allUrls.push(...this.parseSitemapXml(nestedXml));
-              }
-            } catch {
+              if (!nestedResponse.ok) continue;
+              const nestedXml = await nestedResponse.text();
+              allUrls.push(...this.readSitemapLocs(nestedResponse.status, nestedResponse.headers, nestedXml));
+            } catch (err) {
+              if (err instanceof ScrapeFailure) throw err;
               continue;
             }
           }
@@ -61,13 +95,13 @@ export class DiscoveryService {
 
         allUrls.push(...urls);
 
-        if (allUrls.length > 0) break; // Found a working sitemap
-      } catch {
+        if (allUrls.length > 0) break;
+      } catch (err) {
+        if (err instanceof ScrapeFailure) throw err;
         continue;
       }
     }
 
-    // Filter for career-related URLs
     return allUrls.filter(url => {
       const lower = url.toLowerCase();
       return CAREER_KEYWORDS.some(kw => lower.includes(kw));
@@ -97,7 +131,6 @@ export class DiscoveryService {
         const xml = await response.text();
         const urls = this.parseSitemapXml(xml);
 
-        // Check if this is a sitemap index (contains other sitemaps)
         const nestedSitemaps = urls.filter(u => u.endsWith('.xml'));
         if (nestedSitemaps.length > 0) {
           for (const nestedUrl of nestedSitemaps.slice(0, 10)) {
@@ -116,7 +149,6 @@ export class DiscoveryService {
           }
         }
 
-        // Add non-sitemap URLs
         allUrls.push(...urls.filter(u => !u.endsWith('.xml')));
 
         if (allUrls.length > 0) break;
@@ -128,9 +160,18 @@ export class DiscoveryService {
     return [...new Set(allUrls)];
   }
 
+  /** Sitemap locs, or nothing when the body is a challenge or an error page. */
+  readSitemapLocs(
+    status: number,
+    headers: Headers | Record<string, string> | undefined,
+    body: string,
+  ): string[] {
+    if (classifyFetch(status, headers, body).kind !== 'ok') return [];
+    return this.parseSitemapXml(body);
+  }
+
   parseSitemapXml(xml: string): string[] {
     const urls: string[] = [];
-    // Match <loc>...</loc> tags
     const locRegex = /<loc>([^<]+)<\/loc>/gi;
     let match;
     while ((match = locRegex.exec(xml)) !== null) {
@@ -169,87 +210,188 @@ export class DiscoveryService {
     return null;
   }
 
-  async findCareerPage(domain: string): Promise<{
-    url: string;
-    html: string;
-    platform: Platform;
-    additionalUrls?: string[];
-  } | null> {
-    // First, try to find career URLs from sitemap
-    const sitemapUrls = await this.fetchSitemapUrls(domain);
+  async findCareerPage(domain: string, deadline?: number): Promise<CareerPage | null> {
+    this.assertBudget(deadline, domain);
+    const signals = freshSignals();
+    const sitemapUrls = await this.fetchSitemapUrls(domain, deadline);
     console.log(`Found ${sitemapUrls.length} career-related URLs in sitemap`);
+    const additional = sitemapUrls.slice(0, 50);
 
-    // Try sitemap URLs first (they're often more direct)
     if (sitemapUrls.length > 0) {
-      // Sort by likelihood of being a main careers page
       const sortedUrls = this.sortCareerUrls(sitemapUrls);
-
       for (const url of sortedUrls.slice(0, 5)) {
-        try {
-          const { html, status } = await this.scraper.fetch(url);
-          if (status >= 400) continue; // Skip error pages (404, 500, etc.)
-          if (this.looksLikeCareerPage(html)) {
-            const platform = this.detectPlatform(url) || this.detectPlatformFromHtml(html);
-            // Pass along other sitemap URLs for the AI to consider
-            return { url, html, platform, additionalUrls: sortedUrls.slice(0, 50) };
-          }
-        } catch {
-          continue;
-        }
+        const found = await this.consider(url, domain, deadline, signals, additional);
+        if (found) return found;
       }
     }
 
-    // Fall back to standard URL candidates
-    const candidates = getCareerPageCandidates(domain);
-
-    for (let i = 0; i < candidates.length; i += 3) {
-      const batch = candidates.slice(i, i + 3);
-      const results = await Promise.allSettled(
-        batch.map(async (url) => {
-          const { html, status } = await this.scraper.fetch(url);
-          return { url, html, status };
-        })
-      );
-
-      for (const result of results) {
-        if (result.status === 'fulfilled') {
-          const { url, html, status } = result.value;
-          if (status >= 400) continue; // Skip error pages (404, 500, etc.)
-          if (this.looksLikeCareerPage(html)) {
-            const platform = this.detectPlatform(url) || this.detectPlatformFromHtml(html);
-            return { url, html, platform, additionalUrls: sitemapUrls.slice(0, 50) };
-          }
-        }
-      }
+    for (const url of getCareerPageCandidates(domain)) {
+      const found = await this.consider(url, domain, deadline, signals, additional);
+      if (found) return found;
     }
 
+    const homeUrl = normalizeUrl(domain);
+    this.assertBudget(deadline, domain);
+    let home: GuardedFetchResult;
     try {
-      const { html, status: homeStatus } = await this.scraper.fetch(normalizeUrl(domain));
-      if (homeStatus < 400) {
-        const careerLinks = this.scraper.extractCareerLinks(html, normalizeUrl(domain));
-
-        for (const link of careerLinks.slice(0, 3)) {
-          try {
-            const { html: careerHtml, status: linkStatus } = await this.scraper.fetch(link);
-            if (linkStatus >= 400) continue; // Skip error pages
-            if (this.looksLikeCareerPage(careerHtml)) {
-              const platform = this.detectPlatform(link) || this.detectPlatformFromHtml(careerHtml);
-              return { url: link, html: careerHtml, platform, additionalUrls: sitemapUrls.slice(0, 50) };
-            }
-          } catch {
-            continue;
-          }
-        }
+      home = await this.fetcher.fetch(homeUrl, deadline);
+    } catch (err) {
+      if (err instanceof ScrapeFailure) {
+        err.attachDomain(domain);
+        throw err;
       }
-    } catch {
-      // Homepage not accessible
+      signals.sawNetwork = true;
+      return this.finish(domain, signals);
     }
 
-    return null;
+    const homePage = this.observe(home, homeUrl, domain, signals, additional);
+    if (homePage) return homePage;
+
+    if (home.classification.kind === 'ok') {
+      const careerLinks = this.scraper.extractCareerLinks(home.html, homeUrl);
+      for (const link of careerLinks.slice(0, 3)) {
+        const found = await this.consider(link, domain, deadline, signals, additional);
+        if (found) return found;
+      }
+    }
+
+    return this.finish(domain, signals);
+  }
+
+  private async consider(
+    url: string,
+    domain: string,
+    deadline: number | undefined,
+    signals: DiscoverySignals,
+    additionalUrls: string[],
+  ): Promise<CareerPage | null> {
+    this.assertBudget(deadline, domain);
+    let fetched: GuardedFetchResult;
+    try {
+      fetched = await this.fetcher.fetch(url, deadline);
+    } catch (err) {
+      if (err instanceof ScrapeFailure) {
+        err.attachDomain(domain);
+        throw err;
+      }
+      signals.sawNetwork = true;
+      return null;
+    }
+    return this.observe(fetched, url, domain, signals, additionalUrls);
+  }
+
+  private observe(
+    fetched: GuardedFetchResult,
+    url: string,
+    domain: string,
+    signals: DiscoverySignals,
+    additionalUrls: string[],
+  ): CareerPage | null {
+    const { classification } = fetched;
+    switch (classification.kind) {
+      case 'challenge': {
+        const role = hostRole(url, domain);
+        if (role === 'apex' || role === 'www') {
+          throw new ScrapeFailure({
+            code: 'blocked',
+            reason: classification.reason ?? 'bot_challenge',
+            retryable: false,
+            domain,
+            stage: 'discovery',
+            message: `Challenge from ${classification.vendor ?? 'unknown'} at ${url}`,
+            target: {
+              url,
+              httpStatus: fetched.status,
+              vendor: classification.vendor,
+            },
+          });
+        }
+        console.info(JSON.stringify({
+          msg: 'scrape skip challenged subdomain',
+          domain,
+          url,
+          vendor: classification.vendor,
+        }));
+        return null;
+      }
+      case 'not_found':
+        signals.sawNotFound = true;
+        return null;
+      case 'upstream_error':
+        signals.sawUpstream = true;
+        return null;
+      case 'transport_error':
+        if (classification.reason === 'timeout') signals.sawTimeout = true;
+        else signals.sawNetwork = true;
+        return null;
+      case 'ok':
+        signals.sawOk = true;
+        if (this.looksLikeCareerPage(fetched.html)) {
+          const platform = this.detectPlatform(url) || this.detectPlatformFromHtml(fetched.html);
+          return { url, html: fetched.html, platform, additionalUrls };
+        }
+        return null;
+      default:
+        return null;
+    }
+  }
+
+  private finish(domain: string, signals: DiscoverySignals): null {
+    const genuineEmpty = signals.sawOk
+      || (signals.sawNotFound && !signals.sawUpstream && !signals.sawNetwork && !signals.sawTimeout);
+    if (genuineEmpty) return null;
+
+    if (signals.sawTimeout && !signals.sawUpstream) {
+      throw new ScrapeFailure({
+        code: 'timeout',
+        reason: 'timeout',
+        retryable: true,
+        domain,
+        stage: 'discovery',
+        message: 'Scrape timed out while fetching the career page',
+      });
+    }
+
+    throw new ScrapeFailure({
+      code: 'upstream_unavailable',
+      reason: signals.sawUpstream ? 'upstream_http' : 'network',
+      retryable: true,
+      domain,
+      stage: 'discovery',
+      message: signals.sawUpstream ? 'Target returned an upstream error' : 'Target could not be reached',
+    });
+  }
+
+  private assertBudget(deadline: number | undefined, domain: string): void {
+    if (deadline !== undefined && Date.now() >= deadline) {
+      throw new ScrapeFailure({
+        code: 'timeout',
+        reason: 'timeout',
+        retryable: true,
+        domain,
+        stage: 'budget',
+        message: 'Scrape budget exceeded',
+      });
+    }
+  }
+
+  private remainingTimeout(deadline: number | undefined, domain: string, cap: number): number {
+    if (deadline === undefined) return cap;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new ScrapeFailure({
+        code: 'timeout',
+        reason: 'timeout',
+        retryable: true,
+        domain,
+        stage: 'budget',
+        message: 'Scrape budget exceeded',
+      });
+    }
+    return Math.max(1, Math.min(cap, remaining));
   }
 
   private sortCareerUrls(urls: string[]): string[] {
-    // Prioritize main career pages over individual job posts
     const mainPagePatterns = [
       /\/(careers?|jobs?|vacatures?|werken-bij|werkenbij)\/?$/i,
       /\/(careers?|jobs?|vacatures?)\/(overview|all|list)?\/?$/i,
@@ -260,23 +402,14 @@ export class DiscoveryService {
       const bIsMain = mainPagePatterns.some(p => p.test(b));
       if (aIsMain && !bIsMain) return -1;
       if (bIsMain && !aIsMain) return 1;
-      return a.length - b.length; // Shorter URLs tend to be overview pages
+      return a.length - b.length;
     });
   }
 
   private looksLikeCareerPage(html: string): boolean {
-    const lower = html.toLowerCase();
-    const careerIndicators = [
-      'vacancy', 'vacancies', 'vacature', 'vacatures',
-      'job opening', 'job listings', 'open position',
-      'we are hiring', 'join our team', 'career',
-      'werken bij', 'kom werken',
-    ];
-
-    return careerIndicators.some(indicator => lower.includes(indicator));
+    return hasCareerSignals(html);
   }
 
-  // Extract department/category links from career page to scrape more vacancies
   extractDepartmentLinks(html: string, baseUrl: string): string[] {
     const links: string[] = [];
     const linkRegex = /<a[^>]+href=["']([^"']+)["'][^>]*>/gi;
@@ -298,7 +431,6 @@ export class DiscoveryService {
       if (departmentKeywords.some(kw => lower.includes(kw))) {
         try {
           const fullUrl = new URL(href, baseUrl).href;
-          // Only include internal links
           if (fullUrl.includes(new URL(baseUrl).hostname.replace('www.', ''))) {
             links.push(fullUrl);
           }

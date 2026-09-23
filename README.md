@@ -24,6 +24,7 @@ npm run dev
 | Variable | Description |
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Claude API key (required) |
+| `ANTHROPIC_MODEL` | Vacancy extraction model (optional, default `claude-haiku-4-5-20251001`) |
 | `REDIS_URL` | Redis connection URL (optional, uses memory cache if not set) |
 | `PORT` | Server port (default: 3000) |
 | `API_KEY` | Your API key for authentication |

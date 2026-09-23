@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { RecruiteeParser } from '../recruitee';
+import { parseWithPlatform } from '../index';
 
 describe('RecruiteeParser', () => {
   const parser = new RecruiteeParser();
@@ -27,5 +28,9 @@ describe('RecruiteeParser', () => {
     expect(vacancy.location).toBe('Amsterdam');
     expect(vacancy.department).toBe('Engineering');
     expect(vacancy.type).toBe('fulltime');
+  });
+
+  it('does not throw when the host is not recruitee.com', async () => {
+    await expect(parseWithPlatform('recruitee', 'https://bas-hr.nl/vacatures')).resolves.toBeNull();
   });
 });

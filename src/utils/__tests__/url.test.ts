@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { normalizeUrl, getCareerPageCandidates, extractDomain, createVacancyId } from '../url';
+import { normalizeUrl, getCareerPageCandidates, extractDomain, createVacancyId, hostRole } from '../url';
 
 describe('URL utilities', () => {
   describe('normalizeUrl', () => {
@@ -33,6 +33,15 @@ describe('URL utilities', () => {
 
     it('should handle subdomains', () => {
       expect(extractDomain('https://careers.example.nl')).toBe('example.nl');
+    });
+  });
+
+  describe('hostRole', () => {
+    it('treats apex and www as the site and guessed hosts as other', () => {
+      expect(hostRole('https://example.nl/vacatures', 'example.nl')).toBe('apex');
+      expect(hostRole('https://www.example.nl/', 'example.nl')).toBe('www');
+      expect(hostRole('https://jobs.example.nl/', 'example.nl')).toBe('other');
+      expect(hostRole('https://werkenbijexample.nl/', 'example.nl')).toBe('other');
     });
   });
 

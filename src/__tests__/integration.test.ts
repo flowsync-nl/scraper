@@ -3,6 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import Fastify from 'fastify';
 import { Orchestrator } from '../services/orchestrator';
 import { scrapeRoutes } from '../routes/scrape';
+import { ScrapeFailure } from '../services/scrape-failure';
 
 describe('API Integration', () => {
   const fastify = Fastify();
@@ -10,7 +11,17 @@ describe('API Integration', () => {
   beforeAll(async () => {
     // Mock orchestrator for testing
     const mockOrchestrator = {
-      scrape: async (domain: string) => ({
+      scrape: async (domain: string) => {
+        if (domain === 'blocked.nl') {
+          throw new ScrapeFailure({
+            code: 'blocked',
+            reason: 'bot_challenge',
+            domain,
+            stage: 'discovery',
+            target: { url: 'https://blocked.nl/vacatures', httpStatus: 202, vendor: 'siteground' },
+          });
+        }
+        return {
         domain,
         hasVacancies: true,
         vacancyCount: 1,
@@ -37,7 +48,8 @@ describe('API Integration', () => {
         },
         cached: false,
         scrapedAt: new Date().toISOString(),
-      }),
+      };
+      },
       close: async () => {},
     } as unknown as Orchestrator;
 
@@ -58,6 +70,7 @@ describe('API Integration', () => {
     });
 
     expect(response.statusCode).toBe(401);
+    expect(JSON.parse(response.body).code).toBe('unauthorized');
   });
 
   it('should return 400 for invalid domain', async () => {
@@ -69,6 +82,7 @@ describe('API Integration', () => {
     });
 
     expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).code).toBe('invalid_request');
   });
 
   it('should scrape valid domain', async () => {
@@ -84,6 +98,26 @@ describe('API Integration', () => {
     expect(body.domain).toBe('example.nl');
     expect(body.hasVacancies).toBe(true);
     expect(body.vacancies).toHaveLength(1);
+  });
+
+  it('maps an injected block to 422', async () => {
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/api/scrape',
+      headers: { authorization: 'Bearer test-key' },
+      payload: { domain: 'blocked.nl' },
+    });
+
+    expect(response.statusCode).toBe(422);
+    const body = JSON.parse(response.body);
+    expect(body).toMatchObject({
+      code: 'blocked',
+      reason: 'bot_challenge',
+      retryable: false,
+      domain: 'blocked.nl',
+      target: { vendor: 'siteground', httpStatus: 202 },
+    });
+    expect(body.stack).toBeUndefined();
   });
 
   it('should return health check', async () => {

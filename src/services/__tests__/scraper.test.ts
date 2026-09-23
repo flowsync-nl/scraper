@@ -1,5 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, expect, it } from 'vitest';
+import type { Browser } from 'playwright';
 import { ScraperService } from '../scraper';
+import { ScrapeFailure } from '../scrape-failure';
 
 describe('ScraperService', () => {
   const scraper = new ScraperService();
@@ -46,5 +48,56 @@ describe('ScraperService', () => {
     expect(links.some(l => l.includes('careers'))).toBe(true);
     expect(links.some(l => l.includes('jobs'))).toBe(true);
     expect(links.some(l => l.includes('contact'))).toBe(false);
+  });
+
+  it('relaunches a disconnected browser once and then reports browser_unavailable', async () => {
+    const html = `<html><body><h1>Vacatures</h1><p>${'We are hiring a developer in Amsterdam. '.repeat(30)}</p></body></html>`;
+    const fakeContext = {
+      newPage: async () => ({
+        addInitScript: async () => {},
+        goto: async () => ({ status: () => 200, headers: () => ({ 'content-type': 'text/html' }) }),
+        content: async () => html,
+        waitForTimeout: async () => {},
+        evaluate: async () => {},
+        locator: () => ({ first: () => ({ isVisible: async () => false, click: async () => {} }) }),
+      }),
+      close: async () => {},
+    };
+
+    class RelaunchScraper extends ScraperService {
+      launches = 0;
+      constructor(private failContexts: number) {
+        super();
+      }
+      protected override async launchBrowser(): Promise<Browser> {
+        this.launches += 1;
+        const launchIndex = this.launches;
+        return {
+          isConnected: () => true,
+          close: async () => {},
+          newContext: async () => {
+            if (launchIndex <= this.failContexts) {
+              throw new Error('Target page, context or browser has been closed');
+            }
+            return fakeContext;
+          },
+        } as unknown as Browser;
+      }
+    }
+
+    const recovered = new RelaunchScraper(1);
+    const page = await recovered.fetchWithPlaywright('https://example.nl/vacatures', 1000, 'probe');
+    expect(page.status).toBe(200);
+    expect(recovered.launches).toBe(2);
+    await recovered.close();
+
+    const dead = new RelaunchScraper(2);
+    await expect(dead.fetchWithPlaywright('https://example.nl/vacatures', 1000, 'probe')).rejects.toMatchObject({
+      code: 'internal',
+      reason: 'browser_unavailable',
+    });
+    expect(dead.launches).toBe(2);
+    await expect(dead.fetchWithPlaywright('https://example.nl/jobs', 1000, 'probe')).rejects.toBeInstanceOf(ScrapeFailure);
+    await dead.close();
   });
 });
