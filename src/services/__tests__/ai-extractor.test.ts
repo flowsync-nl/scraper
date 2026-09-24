@@ -78,6 +78,23 @@ describe('AIExtractor', () => {
     expect(retry).toHaveBeenCalledTimes(2);
   });
 
+  it('maps an aborted messages.create to timeout instead of extractor_failed', async () => {
+    const create = vi.fn((params: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+      const fail = () => {
+        const err = new Error('Request was aborted');
+        err.name = 'AbortError';
+        reject(err);
+      };
+      if (params.signal?.aborted) fail();
+      else params.signal?.addEventListener('abort', fail, { once: true });
+    }));
+    const signal = AbortSignal.timeout(20);
+    await expect(new AIExtractor('test-key', client(create)).extract(careerHtml, 'https://example.nl/careers', undefined, signal))
+      .rejects.toMatchObject({ code: 'timeout', reason: 'timeout', stage: 'extract', retryable: true });
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0][0].signal).toBe(signal);
+  });
+
   it('wraps a schema mismatch as extractor_parse without a second model call', async () => {
     const create = vi.fn().mockResolvedValue({ content: [{ type: 'text', text: 'not json' }] });
     await expect(new AIExtractor('test-key', client(create)).extract(careerHtml, 'https://example.nl/careers'))

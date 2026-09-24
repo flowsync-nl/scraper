@@ -112,9 +112,10 @@ export class ScraperService {
     await this.installPatches(page);
 
     try {
+      const deadline = Date.now() + timeout;
       const response = await page.goto(url, {
         waitUntil: mode === 'probe' ? 'domcontentloaded' : 'networkidle',
-        timeout,
+        timeout: Math.max(0, deadline - Date.now()),
       });
       const status = response?.status() ?? 0;
       const headers = response ? lowerCaseHeaders(response.headers()) : {};
@@ -124,18 +125,11 @@ export class ScraperService {
         return { html: earlyHtml, status, headers };
       }
 
-      await page.waitForTimeout(3000);
-      await this.dismissCookieConsent(page);
+      if (Date.now() >= deadline) {
+        return { html: earlyHtml, status, headers };
+      }
 
-      await page.evaluate(async () => {
-        for (let i = 0; i < 3; i++) {
-          window.scrollBy(0, window.innerHeight);
-          await new Promise(r => setTimeout(r, 500));
-        }
-        window.scrollTo(0, 0);
-      });
-
-      await page.waitForTimeout(2000);
+      await this.settleAfterGoto(page, deadline);
 
       const html = await page.content();
       return { html, status, headers };
@@ -252,7 +246,36 @@ export class ScraperService {
     });
   }
 
-  private async dismissCookieConsent(page: Page): Promise<void> {
+  /** Cookie, scroll, and settle waits share the goto timeout. No second clock. */
+  private async settleAfterGoto(page: Page, deadline: number): Promise<void> {
+    const wait = async (ms: number) => {
+      const slice = Math.min(ms, deadline - Date.now());
+      if (slice <= 0) return;
+      await page.waitForTimeout(slice);
+    };
+
+    await wait(3000);
+    if (Date.now() >= deadline) return;
+    await this.dismissCookieConsent(page, deadline);
+    if (Date.now() >= deadline) return;
+
+    const scrollBudget = deadline - Date.now();
+    if (scrollBudget <= 0) return;
+    await page.evaluate(async (budget: number) => {
+      const step = Math.min(500, Math.floor(budget / 4));
+      if (step <= 0) return;
+      for (let i = 0; i < 3; i++) {
+        window.scrollBy(0, window.innerHeight);
+        await new Promise(r => setTimeout(r, step));
+      }
+      window.scrollTo(0, 0);
+    }, scrollBudget);
+
+    if (Date.now() >= deadline) return;
+    await wait(2000);
+  }
+
+  private async dismissCookieConsent(page: Page, deadline?: number): Promise<void> {
     const selectors = [
       'button:has-text("Accepteren")',
       'button:has-text("Alles accepteren")',
@@ -280,11 +303,16 @@ export class ScraperService {
     ];
 
     for (const selector of selectors) {
+      if (deadline !== undefined && Date.now() >= deadline) return;
+      const visibilityTimeout = deadline === undefined ? 500 : Math.min(500, deadline - Date.now());
+      if (visibilityTimeout <= 0) return;
       try {
         const button = page.locator(selector).first();
-        if (await button.isVisible({ timeout: 500 })) {
+        if (await button.isVisible({ timeout: visibilityTimeout })) {
           await button.click();
-          await page.waitForTimeout(1000);
+          if (deadline !== undefined && Date.now() >= deadline) return;
+          const afterClick = deadline === undefined ? 1000 : Math.min(1000, deadline - Date.now());
+          if (afterClick > 0) await page.waitForTimeout(afterClick);
           return;
         }
       } catch {

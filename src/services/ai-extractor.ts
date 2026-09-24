@@ -3,7 +3,7 @@ import { Vacancy } from '../types/vacancy';
 import { createVacancyId } from '../utils/url';
 import { z } from 'zod';
 import { classifyFetch } from './fetch-classifier';
-import { isRetryableTransport } from './net-errors';
+import { isRetryableTransport, isTimeoutError } from './net-errors';
 import { ScrapeFailure } from './scrape-failure';
 
 export const DEFAULT_ANTHROPIC_MODEL = 'claude-haiku-4-5-20251001';
@@ -14,6 +14,8 @@ interface CompletionClient {
       model: string;
       max_tokens: number;
       messages: Array<{ role: 'user'; content: string }>;
+      signal?: AbortSignal;
+      timeout?: number;
     }) => Promise<{ content: Array<{ type: string; text?: string }> }>;
   };
 }
@@ -157,14 +159,21 @@ export class AIExtractor {
     });
   }
 
-  private async complete(prompt: string, maxTokens: number): Promise<string> {
+  private async complete(prompt: string, maxTokens: number, signal?: AbortSignal, deadline?: number): Promise<string> {
+    if (signal?.aborted || (deadline !== undefined && Date.now() >= deadline)) {
+      throw this.timeoutFailure();
+    }
     let last: unknown;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
+        if (signal?.aborted || (deadline !== undefined && Date.now() >= deadline)) throw this.timeoutFailure();
+        const timeout = deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
         const response = await this.client.messages.create({
           model: this.modelId(),
           max_tokens: maxTokens,
           messages: [{ role: 'user', content: prompt }],
+          ...(signal ? { signal } : {}),
+          ...(timeout !== undefined ? { timeout } : {}),
         });
         const content = response.content[0];
         if (!content || content.type !== 'text' || !content.text) {
@@ -179,12 +188,28 @@ export class AIExtractor {
         return content.text;
       } catch (err) {
         if (err instanceof ScrapeFailure) throw err;
+        if (signal?.aborted || (deadline !== undefined && Date.now() >= deadline) || isTimeoutError(err)) {
+          throw this.timeoutFailure();
+        }
         last = err;
         if (attempt === 0 && isRetryableAnthropic(err)) continue;
         throw mapAnthropicFailure(err);
       }
     }
+    if (signal?.aborted || (deadline !== undefined && Date.now() >= deadline) || isTimeoutError(last)) {
+      throw this.timeoutFailure();
+    }
     throw mapAnthropicFailure(last);
+  }
+
+  private timeoutFailure(): ScrapeFailure {
+    return new ScrapeFailure({
+      code: 'timeout',
+      reason: 'timeout',
+      retryable: true,
+      stage: 'extract',
+      message: 'Scrape timed out',
+    });
   }
 
   private parseModelJson<T>(text: string, parse: (value: unknown) => T): T {
@@ -276,10 +301,16 @@ Tekst:
 ${cleanedHtml}`;
   }
 
-  async extract(html: string, url: string, additionalUrls?: string[]): Promise<{ vacancies: Vacancy[]; confidence: number }> {
+  async extract(
+    html: string,
+    url: string,
+    additionalUrls?: string[],
+    signal?: AbortSignal,
+    deadline?: number,
+  ): Promise<{ vacancies: Vacancy[]; confidence: number }> {
     this.assertNotChallenge(html, url);
     const prompt = this.buildPrompt(html, url, additionalUrls);
-    const text = await this.complete(prompt, 8192);
+    const text = await this.complete(prompt, 8192, signal, deadline);
     const parsed = this.parseModelJson(text, (value) => AIResponseSchema.parse(value));
     const now = new Date().toISOString();
 
@@ -404,10 +435,10 @@ Tekst:
 ${cleanedHtml}`;
   }
 
-  async extractDetails(html: string, vacancy: Vacancy): Promise<Partial<Vacancy>> {
+  async extractDetails(html: string, vacancy: Vacancy, signal?: AbortSignal, deadline?: number): Promise<Partial<Vacancy>> {
     this.assertNotChallenge(html, vacancy.url);
     const prompt = this.buildDetailPrompt(html, vacancy.title);
-    const text = await this.complete(prompt, 4096);
+    const text = await this.complete(prompt, 4096, signal, deadline);
     const parsed = this.parseModelJson(text, (value) => AIDetailSchema.parse(value));
 
     // Merge with existing vacancy data, preferring new detailed data

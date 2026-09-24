@@ -5,6 +5,9 @@ import { z } from 'zod';
 import { scrapeRoutes } from '../scrape';
 import { Orchestrator } from '../../services/orchestrator';
 import { ScrapeFailure } from '../../services/scrape-failure';
+import { CacheService } from '../../services/cache';
+import { DiscoveryService } from '../../services/discovery';
+import { AIExtractor } from '../../services/ai-extractor';
 
 describe('POST /api/scrape error contract', () => {
   const lines: string[] = [];
@@ -181,6 +184,42 @@ describe('POST /api/scrape error contract', () => {
       retryable: false,
       domain: 'example.nl',
     });
+  });
+
+  it('returns JSON timeout when the handler outlasts the scrape budget', async () => {
+    process.env.API_KEY = 'test-key';
+    const hanging = new Orchestrator({
+      anthropicApiKey: 'test-key',
+      budgetMs: 40,
+      cache: new CacheService(),
+      discovery: {
+        findCareerPage: () => new Promise(() => {}),
+        extractDepartmentLinks: () => [],
+      } as unknown as DiscoveryService,
+      aiExtractor: {
+        extract: () => new Promise(() => {}),
+        extractDetails: () => new Promise(() => {}),
+      } as unknown as AIExtractor,
+    });
+    const app = Fastify({ logger: false });
+    await scrapeRoutes(app, hanging);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/scrape',
+      headers: { authorization: 'Bearer test-key' },
+      payload: { domain: 'slow-handler.nl' },
+    });
+    expect(response.statusCode).toBe(504);
+    expect(String(response.headers['content-type'])).toContain('application/json');
+    expect(JSON.parse(response.body)).toMatchObject({
+      error: 'Scrape timed out',
+      code: 'timeout',
+      reason: 'timeout',
+      retryable: true,
+      domain: 'slow-handler.nl',
+    });
+    expect(response.body).not.toContain('error code: 504');
+    await app.close();
   });
 
   it('still returns the success body', async () => {

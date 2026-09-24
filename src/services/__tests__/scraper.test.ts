@@ -100,4 +100,40 @@ describe('ScraperService', () => {
     await expect(dead.fetchWithPlaywright('https://example.nl/jobs', 1000, 'probe')).rejects.toBeInstanceOf(ScrapeFailure);
     await dead.close();
   });
+
+  it('does not run the cookie or scroll tail when the goto budget is already spent', async () => {
+    const html = `<html><body><h1>Vacatures</h1><p>${'We are hiring a developer in Amsterdam. '.repeat(30)}</p></body></html>`;
+    const calls: string[] = [];
+    const fakeContext = {
+      newPage: async () => ({
+        addInitScript: async () => {},
+        goto: async () => ({ status: () => 200, headers: () => ({ 'content-type': 'text/html' }) }),
+        content: async () => html,
+        waitForTimeout: async () => { calls.push('wait'); },
+        evaluate: async () => { calls.push('scroll'); },
+        locator: () => {
+          calls.push('cookie');
+          return { first: () => ({ isVisible: async () => false, click: async () => {} }) };
+        },
+      }),
+      close: async () => {},
+    };
+
+    class FakeBrowserScraper extends ScraperService {
+      protected override async launchBrowser(): Promise<Browser> {
+        return {
+          isConnected: () => true,
+          close: async () => {},
+          newContext: async () => fakeContext,
+        } as unknown as Browser;
+      }
+    }
+
+    const scraper = new FakeBrowserScraper();
+    const page = await scraper.fetchWithPlaywright('https://example.nl/vacatures', 0, 'full');
+    expect(page.status).toBe(200);
+    expect(page.html).toContain('Vacatures');
+    expect(calls).toEqual([]);
+    await scraper.close();
+  });
 });

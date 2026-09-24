@@ -88,6 +88,16 @@ export class DiscoveryService {
               allUrls.push(...this.readSitemapLocs(nestedResponse.status, nestedResponse.headers, nestedXml));
             } catch (err) {
               if (err instanceof ScrapeFailure) throw err;
+              if (deadline !== undefined && Date.now() >= deadline) {
+                throw new ScrapeFailure({
+                  code: 'timeout',
+                  reason: 'timeout',
+                  retryable: true,
+                  domain,
+                  stage: 'budget',
+                  message: 'Scrape budget exceeded',
+                });
+              }
               continue;
             }
           }
@@ -98,6 +108,16 @@ export class DiscoveryService {
         if (allUrls.length > 0) break;
       } catch (err) {
         if (err instanceof ScrapeFailure) throw err;
+        if (deadline !== undefined && Date.now() >= deadline) {
+          throw new ScrapeFailure({
+            code: 'timeout',
+            reason: 'timeout',
+            retryable: true,
+            domain,
+            stage: 'budget',
+            message: 'Scrape budget exceeded',
+          });
+        }
         continue;
       }
     }
@@ -241,7 +261,7 @@ export class DiscoveryService {
         throw err;
       }
       signals.sawNetwork = true;
-      return this.finish(domain, signals);
+      return this.finish(domain, signals, deadline);
     }
 
     const homePage = this.observe(home, homeUrl, domain, signals, additional);
@@ -255,7 +275,7 @@ export class DiscoveryService {
       }
     }
 
-    return this.finish(domain, signals);
+    return this.finish(domain, signals, deadline);
   }
 
   private async consider(
@@ -273,6 +293,16 @@ export class DiscoveryService {
       if (err instanceof ScrapeFailure) {
         err.attachDomain(domain);
         throw err;
+      }
+      if (deadline !== undefined && Date.now() >= deadline) {
+        throw new ScrapeFailure({
+          code: 'timeout',
+          reason: 'timeout',
+          retryable: true,
+          domain,
+          stage: 'budget',
+          message: 'Scrape budget exceeded',
+        });
       }
       signals.sawNetwork = true;
       return null;
@@ -336,7 +366,20 @@ export class DiscoveryService {
     }
   }
 
-  private finish(domain: string, signals: DiscoverySignals): null {
+  private finish(domain: string, signals: DiscoverySignals, deadline?: number): null {
+    if (deadline !== undefined && Date.now() >= deadline) {
+      throw new ScrapeFailure({
+        code: 'timeout',
+        reason: 'timeout',
+        retryable: true,
+        domain,
+        stage: signals.sawTimeout ? 'discovery' : 'budget',
+        message: signals.sawTimeout
+          ? 'Scrape timed out while fetching the career page'
+          : 'Scrape budget exceeded',
+      });
+    }
+
     const genuineEmpty = signals.sawOk
       || (signals.sawNotFound && !signals.sawUpstream && !signals.sawNetwork && !signals.sawTimeout);
     if (genuineEmpty) return null;
