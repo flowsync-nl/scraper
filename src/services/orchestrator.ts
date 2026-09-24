@@ -6,9 +6,10 @@ import { parseWithPlatform } from './platforms';
 import { GuardedFetcher, type GuardedFetchResult } from './guarded-fetcher';
 import { classifyFetch } from './fetch-classifier';
 import { BlockLock, safeErrorMessage, ScrapeFailure } from './scrape-failure';
+import { isTimeoutError } from './net-errors';
 import { ScrapeResponse, Vacancy } from '../types/vacancy';
 
-export const SCRAPE_BUDGET_MS = 25_000;
+export const SCRAPE_BUDGET_MS = 18_000;
 const BLOCK_LOCK_SECONDS = 10 * 60;
 
 export class Orchestrator {
@@ -58,17 +59,60 @@ export class Orchestrator {
     }
 
     const deadline = Date.now() + this.budgetMs;
+    const signal = AbortSignal.timeout(Math.max(0, this.budgetMs));
     try {
-      return await this.scrapeUncached(domain, detailLimit, cacheKey, deadline);
+      return await this.withDeadline(
+        signal,
+        domain,
+        this.scrapeUncached(domain, detailLimit, cacheKey, deadline, signal),
+      );
     } catch (err) {
-      if (err instanceof ScrapeFailure) {
-        err.attachDomain(domain);
-        if (err.code === 'blocked') {
-          await this.cache.set(lockKey, err.toLock(), BLOCK_LOCK_SECONDS);
+      const failure = this.normalizeBudgetError(err, domain, signal);
+      if (failure instanceof ScrapeFailure) {
+        failure.attachDomain(domain);
+        if (failure.code === 'blocked') {
+          await this.cache.set(lockKey, failure.toLock(), BLOCK_LOCK_SECONDS);
         }
       }
-      throw err;
+      throw failure;
     }
+  }
+
+  /** Rejects when the scrape budget elapses, even if an inner await never returns. */
+  private withDeadline<T>(signal: AbortSignal, domain: string, work: Promise<T>): Promise<T> {
+    if (signal.aborted) return Promise.reject(this.budgetFailure(domain));
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(this.budgetFailure(domain));
+      signal.addEventListener('abort', onAbort, { once: true });
+      work.then(
+        (value) => {
+          signal.removeEventListener('abort', onAbort);
+          if (signal.aborted) reject(this.budgetFailure(domain));
+          else resolve(value);
+        },
+        (err) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(err);
+        },
+      );
+    });
+  }
+
+  private normalizeBudgetError(err: unknown, domain: string, signal: AbortSignal): unknown {
+    if (err instanceof ScrapeFailure) return err;
+    if (signal.aborted || isTimeoutError(err)) return this.budgetFailure(domain);
+    return err;
+  }
+
+  private budgetFailure(domain: string): ScrapeFailure {
+    return new ScrapeFailure({
+      code: 'timeout',
+      reason: 'timeout',
+      retryable: true,
+      domain,
+      stage: 'budget',
+      message: 'Scrape budget exceeded',
+    });
   }
 
   private async scrapeUncached(
@@ -76,11 +120,13 @@ export class Orchestrator {
     detailLimit: number,
     cacheKey: string,
     deadline: number,
+    signal: AbortSignal,
   ): Promise<ScrapeResponse> {
     this.assertBudget(deadline, domain);
     const careerPage = await this.discovery.findCareerPage(domain, deadline);
 
     if (!careerPage) {
+      this.assertBudget(deadline, domain);
       const response = this.emptyResponse(domain);
       await this.cache.set(cacheKey, response);
       return response;
@@ -103,7 +149,9 @@ export class Orchestrator {
       const result = await this.aiExtractor.extract(
         careerPage.html,
         careerPage.url,
-        careerPage.additionalUrls
+        careerPage.additionalUrls,
+        signal,
+        deadline,
       );
       vacancies = result.vacancies;
       method = 'ai';
@@ -122,7 +170,7 @@ export class Orchestrator {
             }
             if (deptPage.classification.kind !== 'ok') continue;
             this.assertPageAllowed(deptPage.html, deptUrl, domain);
-            const deptResult = await this.aiExtractor.extract(deptPage.html, deptUrl);
+            const deptResult = await this.aiExtractor.extract(deptPage.html, deptUrl, undefined, signal, deadline);
 
             const existingIds = new Set(vacancies.map(v => v.id));
             for (const vacancy of deptResult.vacancies) {
@@ -133,6 +181,7 @@ export class Orchestrator {
             }
           } catch (err) {
             this.rethrowFatal(err);
+            this.rethrowIfBudget(err, deadline, domain, signal);
             console.error(`Failed to scrape department page ${deptUrl}: ${safeErrorMessage(err)}`);
           }
         }
@@ -160,11 +209,12 @@ export class Orchestrator {
           }
           if (detailPage.classification.kind !== 'ok') continue;
           this.assertPageAllowed(detailPage.html, vacancy.url, domain);
-          const details = await this.aiExtractor.extractDetails(detailPage.html, vacancy);
+          const details = await this.aiExtractor.extractDetails(detailPage.html, vacancy, signal, deadline);
           Object.assign(vacancy, details);
           console.log(`  ✓ Got details: ${details.requirements?.length || 0} requirements, ${details.benefits?.length || 0} benefits`);
         } catch (err) {
           this.rethrowFatal(err);
+          this.rethrowIfBudget(err, deadline, domain, signal);
           console.error(`  ✗ Failed to get details for ${vacancy.title}: ${safeErrorMessage(err)}`);
         }
       }
@@ -184,6 +234,9 @@ export class Orchestrator {
       scrapedAt: new Date().toISOString(),
     };
 
+    if (signal.aborted || Date.now() >= deadline) {
+      throw this.budgetFailure(domain);
+    }
     await this.cache.set(cacheKey, response);
     return response;
   }
@@ -247,6 +300,14 @@ export class Orchestrator {
     if (!(err instanceof ScrapeFailure)) return;
     if (err.code === 'timeout' || err.reason === 'model_unavailable' || err.reason === 'browser_unavailable') {
       throw err;
+    }
+  }
+
+  /** A budget abort must leave the department/detail loop; other failures stay skippable. */
+  private rethrowIfBudget(err: unknown, deadline: number, domain: string, signal: AbortSignal): void {
+    if (err instanceof ScrapeFailure && err.code === 'timeout') throw err;
+    if (signal.aborted || Date.now() >= deadline) {
+      throw this.budgetFailure(domain);
     }
   }
 

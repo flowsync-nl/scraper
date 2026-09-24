@@ -216,6 +216,70 @@ describe('discovery blocked and cache', () => {
     expect(await cache.get(cache.keyFor('bas-hr.nl'))).toBeNull();
   });
 
+  it('aborts an extract that never resolves and does not cache or lock the domain', async () => {
+    const cache = new CacheService();
+    const orchestrator = new Orchestrator({
+      anthropicApiKey: 'test-key',
+      cache,
+      budgetMs: 30,
+      discovery: {
+        findCareerPage: async () => ({
+          url: 'https://example.nl/vacatures',
+          html: careerHtml,
+          platform: null,
+        }),
+        extractDepartmentLinks: () => [],
+      } as unknown as DiscoveryService,
+      aiExtractor: {
+        extract: () => new Promise(() => {}),
+        extractDetails: () => new Promise(() => {}),
+      } as unknown as AIExtractor,
+    });
+
+    await expect(orchestrator.scrape('example.nl')).rejects.toMatchObject({
+      code: 'timeout',
+      reason: 'timeout',
+      retryable: true,
+    });
+    expect(await cache.get(cache.keyFor('example.nl'))).toBeNull();
+    expect(await cache.get(cache.blockKeyFor('example.nl'))).toBeNull();
+  });
+
+  it('throws timeout instead of caching empty when the budget ends after a non-career page', async () => {
+    const realNow = Date.now.bind(Date);
+    const deadline = realNow() + 10_000;
+    let jumped = false;
+    vi.spyOn(Date, 'now').mockImplementation(() => (jumped ? deadline + 20 : realNow()));
+    const pages = source({
+      fetchWithHttp: async () => {
+        jumped = true;
+        return {
+          status: 200,
+          html: '<html><body><p>Welcome to the bakery. Fresh bread every morning.</p></body></html>',
+          headers: { 'content-type': 'text/html' },
+        };
+      },
+      fetchWithPlaywright: async () => {
+        throw new Error('playwright should not run');
+      },
+    });
+    const cache = new CacheService();
+    const orchestrator = new Orchestrator({
+      anthropicApiKey: 'test-key',
+      cache,
+      budgetMs: 10_000,
+      scraper: pages as unknown as ScraperService,
+      aiExtractor: { extract: vi.fn(), extractDetails: vi.fn() } as unknown as AIExtractor,
+    });
+
+    await expect(orchestrator.scrape('example.nl')).rejects.toMatchObject({
+      code: 'timeout',
+      reason: 'timeout',
+    });
+    expect(await cache.get(cache.keyFor('example.nl'))).toBeNull();
+    expect(await cache.get(cache.blockKeyFor('example.nl'))).toBeNull();
+  });
+
   it('does not cache a timeout and does not start discovery when the budget is already spent', async () => {
     const findCareerPage = vi.fn();
     const cache = new CacheService();
